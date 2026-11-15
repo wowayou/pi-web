@@ -77,3 +77,74 @@ Model prompts, live model streaming, and agent execution are outside this suite.
 Failures save a screenshot, Playwright trace, and server log under
 `test-results/e2e/`; CI uploads that directory. Open a trace with
 `npx playwright show-trace test-results/e2e/trace.zip`.
+
+## HTTP/2 connection-pool regression (manual)
+
+`http-connection-pool.mjs` checks the transport mechanism behind
+[Serving Pi Web over HTTP/2](../docs/http2.md), not the Pi Web application.
+It is deliberately separate from `npm run test:e2e` and CI: it needs an
+existing Caddy binary, OpenSSL and Playwright Chromium. It installs nothing,
+starts no Pi session, and makes no model requests.
+
+With the checkout's dependencies and Chromium already available, download
+Caddy from its [official releases](https://github.com/caddyserver/caddy/releases)
+and verify the release digest before running it. A binary unpacked into a
+temporary directory is enough; no system service or root access is needed.
+The checked version for this script is Caddy **2.11.9**.
+
+```sh
+E2E_CADDY_BIN=/absolute/path/to/caddy node e2e/http-connection-pool.mjs
+```
+
+The script starts a synthetic HTTP/1.1 backend, then tests these cases in
+separate browser contexts (the eight-page case shares one context):
+
+- HTTP and HTTPS/HTTP1 negative controls: six EventSources keep a GET from
+  reaching the backend for 800 ms; closing one lets the request complete.
+- Caddy HTTP/2: one page with 12 EventSources and eight pages with 16 total.
+  Each case makes 20 measured GET/POST requests after warming the pages.
+  Every request must reach the backend exactly once, echo the right body,
+  and report the actual browser protocol `h2`. Warm local p95 must be below
+  500 ms and maximum below 2 s; a request is aborted at 5 s.
+- A slow, unread HTTP/2 response must backpressure its upstream before the
+  fixture's 16 MiB cap. Peer requests on the same connection must succeed
+  both before and after cancelling the slow response, without reconnecting.
+- Cancelling one stream or closing a page must release its upstream
+  subscriptions without disconnecting the other streams. An idle keep-alive
+  socket is not an active subscription, so the script does not require every
+  socket to disappear or exactly one physical frontend connection.
+
+JSON output records versions, observed browser connection counts, samples and
+checks. Only the final `phase: "pass"` follows successful cleanup. The 120 s
+hard deadline fails the run and kills its test processes; a failed check or
+cleanup exits nonzero. There are no request replays to recover a failed test.
+Caddy startup probes alone retry connection refusal or its transient
+certificate-not-ready TLS alert, within a 10 s deadline and without bypassing
+certificate validation.
+
+### Isolation and evidence limits
+
+All listeners use `127.0.0.1` and random high ports. Caddy has no admin or HTTP
+redirect listener, uses only its internal CA, and has `skip_install_trust`:
+its CA and configuration live in a temporary HOME/XDG directory, removed at
+exit. A port race is a failure, never a reason to connect to another instance.
+No system/browser trust store is changed. The browser's certificate exception
+is limited to these disposable contexts; Node probes validate the temporary
+CA and hostname normally. **This does not test ordinary browser certificate
+trust or installing a CA.** HTTP/3 is disabled to make the HTTP/2 comparison
+unambiguous.
+
+Browser requests are restricted to the fixture origin and background browser
+networking is disabled. For a hard network boundary, run in a disposable
+container/network namespace with only loopback and no external route. The
+script itself does not create that OS-level boundary. The recorded Linux run
+used an unprivileged user/network/PID namespace; macOS, Windows and native
+Safari/iOS have not been exercised.
+
+The timings are local mechanism observations, not production latency promises.
+This fixture does not replace a real-app proxy check: browser login and
+Secure/HttpOnly cookies, Host/Origin rejection, agent reconnect snapshots,
+terminal offset replay, file-watch revalidation, and `npm run dev` HMR need
+separate checks against the relevant Pi Web version. A published `next start`
+artifact and a development checkout are different evidence; do not build over
+an active dev checkout or substitute an older installed version.
